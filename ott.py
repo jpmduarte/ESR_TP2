@@ -4,28 +4,29 @@ import threading
 import time
 import subprocess
 import re
+import struct
 
 SERVER_IP = '10.0.0.10'
 SERVER_PORT = 5000
-UDP_PORT = 6001
+UDP_PORT = 6001         # usado para PING/PONG e neighbor probing
+INGEST_PORT = 6500      # porta para ingestão de vídeo real
 KEEPALIVE_INTERVAL = 5
 
 node_id = None
-neighbors = {}       # {id: {"ip": str, "port": int, "rtt": float}}
-routes = {}          # {dest_ip: {"next_hop": str, "port": int}}
-clients = set()      # {(client_ip, client_port)}
+neighbors = {}
+routes = {}
 lock = threading.Lock()
 
 
-# ----------------------------------------------------------
-# Helper utilities
-# ----------------------------------------------------------
+# -------------------------------------------------------------------
+# Funções utilitárias
+# -------------------------------------------------------------------
 def send_json(sock, msg):
     sock.send((json.dumps(msg) + "\n").encode())
 
 
 def get_ip_for_destination(dest_ip: str) -> str:
-    """Discover local IP used to reach the given destination (no traffic sent)."""
+    """Descobre o IP local usado para comunicar com o destino (sem enviar pacotes)."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect((dest_ip, 9))
@@ -44,53 +45,53 @@ def get_ip_for_destination(dest_ip: str) -> str:
     return "127.0.0.1"
 
 
-# ----------------------------------------------------------
-# UDP listener — handles both probe PINGs and client JOIN_STREAM
-# ----------------------------------------------------------
+# -------------------------------------------------------------------
+# UDP listener — responde a PING/PONG
+# -------------------------------------------------------------------
 def udp_listener():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('', UDP_PORT))
-    print(f"[INFO] UDP listener on port {UDP_PORT}")
+    print(f"[INFO] UDP listener active on port {UDP_PORT}")
 
     while True:
         data, addr = sock.recvfrom(1024)
-
         if data == b'PING':
             sock.sendto(b'PONG', addr)
 
-        elif data == b'JOIN_STREAM':
-            with lock:
-                clients.add(addr)
-            print(f"[STREAM] Client {addr} joined stream.")
-            # Start stream thread if not already running
-            if not any(t.name == "stream_thread" for t in threading.enumerate()):
-                threading.Thread(target=send_stream, name="stream_thread", daemon=True).start()
 
-        else:
-            pass  # Ignore unknown data
+# -------------------------------------------------------------------
+# Relay de vídeo: recebe do servidor e retransmite via multicast
+# -------------------------------------------------------------------
+def start_relay(group, port, ingest_port):
+    """Recebe chunks UDP do servidor e retransmite para o grupo multicast local."""
+    recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    recv_sock.bind(('', ingest_port))
+    print(f"[RELAY] Listening for ingest on UDP {ingest_port}")
 
+    send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    ttl = struct.pack('b', 1)
+    send_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
 
-# ----------------------------------------------------------
-# Periodic UDP stream sender
-# ----------------------------------------------------------
-def send_stream():
-    """Simulate video streaming by sending UDP packets to all connected clients."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    frame = 0
-    print("[STREAM] Stream thread started.")
+    print(f"[RELAY] Forwarding incoming stream to multicast {group}:{port}")
+
     while True:
-        with lock:
-            targets = list(clients)
-        frame += 1
-        payload = f"FRAME {frame}".encode()
-        for addr in targets:
-            sock.sendto(payload, addr)
-        time.sleep(0.5)  # ~2 frames/second for demo
+        try:
+            data, _ = recv_sock.recvfrom(65507)
+            if not data:
+                continue
+            send_sock.sendto(data, (group, port))
+        except Exception as e:
+            print(f"[RELAY][ERROR] {e}")
+            break
+
+    recv_sock.close()
+    send_sock.close()
+    print("[RELAY] Relay stopped.")
 
 
-# ----------------------------------------------------------
-# Probe other overlay nodes
-# ----------------------------------------------------------
+# -------------------------------------------------------------------
+# Probing entre nós overlay (RTT)
+# -------------------------------------------------------------------
 def probe_nodes(sock, targets):
     results = {}
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -113,9 +114,9 @@ def probe_nodes(sock, targets):
     send_json(sock, msg)
 
 
-# ----------------------------------------------------------
-# Keepalive loop
-# ----------------------------------------------------------
+# -------------------------------------------------------------------
+# Keepalive para o servidor
+# -------------------------------------------------------------------
 def keepalive(sock):
     while True:
         time.sleep(KEEPALIVE_INTERVAL)
@@ -124,9 +125,9 @@ def keepalive(sock):
             send_json(sock, msg)
 
 
-# ----------------------------------------------------------
-# Build routing table from neighbors
-# ----------------------------------------------------------
+# -------------------------------------------------------------------
+# Tabela de rotas overlay (mantém original)
+# -------------------------------------------------------------------
 def recompute_routes():
     global routes
     with lock:
@@ -139,9 +140,9 @@ def recompute_routes():
         print(f"   → {ip} via {r['next_hop']}:{r['port']}")
 
 
-# ----------------------------------------------------------
-# Main control loop (TCP)
-# ----------------------------------------------------------
+# -------------------------------------------------------------------
+# Nó principal
+# -------------------------------------------------------------------
 def start_node():
     global node_id, neighbors
 
@@ -152,7 +153,13 @@ def start_node():
     local_ip = get_ip_for_destination(SERVER_IP)
     print(f"[INFO] Local IP detected: {local_ip}")
 
-    reg = {"type": "REGISTER", "role": "overlay", "ip": local_ip, "port": UDP_PORT}
+    reg = {
+        "type": "REGISTER",
+        "role": "overlay",
+        "ip": local_ip,
+        "port": UDP_PORT,
+        "ingest_port": INGEST_PORT
+    }
     send_json(sock, reg)
 
     threading.Thread(target=keepalive, args=(sock,), daemon=True).start()
@@ -195,6 +202,14 @@ def start_node():
                 for n_id, info in neighbors.items():
                     print(f"   → {info['ip']}:{info['port']}")
                 recompute_routes()
+
+            elif t == "START_RELAY":
+                video = msg.get("video")
+                group = msg.get("group")
+                port = msg.get("port")
+                ingest_port = msg.get("ingest_port", INGEST_PORT)
+                print(f"[RELAY] Starting relay for {video} ({group}:{port}) ingest={ingest_port}")
+                threading.Thread(target=start_relay, args=(group, port, ingest_port), daemon=True).start()
 
     sock.close()
     print("[INFO] Node shut down.")
