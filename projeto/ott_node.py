@@ -5,6 +5,7 @@ import socket
 import threading
 import time
 import heapq
+import base64
 from datetime import datetime
 from collections import deque
 
@@ -399,6 +400,82 @@ class OTTNode:
             # FIX #5: Generate LSA to announce link removal
             self.generate_lsa()
 
+    # =========================================================================
+    # FORWARDING & STREAMING LOGIC (DATA PLANE)
+    # =========================================================================
+
+    def handle_stream_packet(self, msg):
+        """NOVO: Recebe pacote, descodifica e guarda em ficheiro."""
+        payload = msg["payload"]
+        seq = msg["seq"]
+        
+        try:
+            # Descodificar Base64 de volta para binário
+            binary_data = base64.b64decode(payload)
+            
+            # Guardar em disco (Modo 'ab' = append binary)
+            filename = f"received_stream_{self.node_id}.mp4"
+            
+            with open(filename, "ab") as f:
+                f.write(binary_data)
+                
+            # Log apenas de 100 em 100 pacotes
+            if seq % 100 == 0:
+                log(self.node_id, f"Recebido pacote {seq} de {msg['src']} - total guardado em {filename}")
+
+        except Exception as e:
+            log(self.node_id, f"ERRO ao processar pacote de stream: {e}")
+            
+            
+    def start_streaming(self, target_node, filename="3min.mp4"):
+        
+        try:
+            with open(filename, "rb") as f:
+                seq = 1
+                while self.running:
+                    chunk = f.read(4096) # Lê 4KB por chunk
+                    if not chunk:
+                        break
+                        
+                    # Codificar binário para Base64 (para ir dentro do JSON)
+                    b64_data = base64.b64encode(chunk).decode('utf-8')
+                    
+                    packet = {
+                        "type": "STREAM_DATA",
+                        "src": self.node_id,
+                        "dst": target_node,
+                        "seq": seq,
+                        "payload": b64_data
+                    }
+                    
+                    # 1. Obter o primeiro salto (next_hop)
+                    with self.lock:
+                        route_info = self.routes.get(target_node)
+                    
+                    if route_info:
+                        next_hop = route_info['next']
+                        
+                        # 2. Enviar o pacote
+                        with self.lock:
+                            conn_info = self.sock_peers.get(next_hop)
+
+                        if conn_info:
+                            send_json(conn_info['sock'], packet)
+                        else:
+                            log(self.node_id, f"ERRO: Vizinho {next_hop} desligado, parando stream.")
+                            break
+                    else:
+                        log(self.node_id, f"ERRO: Sem rota ativa para {target_node}")
+                        break
+                    
+                    seq += 1
+                    time.sleep(0.01) # Pequena pausa para controlar o débito
+                    
+            log(self.node_id, "Fim do envio do ficheiro de video.")
+            
+        except FileNotFoundError:
+            log(self.node_id, f"ERRO: Ficheiro de video {filename} não encontrado.")
+
 
     ###########################################################################
     # MESSAGE HANDLING
@@ -435,6 +512,34 @@ class OTTNode:
 
         elif mtype == "LSA":
             self.apply_lsa(msg, nid)
+        elif mtype == "STREAM_DATA":
+            dst = msg["dst"]
+            
+            # 1. CASO CLIENTE: Sou eu o destino final? (O4)
+            if dst == self.node_id:
+                self.handle_stream_packet(msg)
+                
+            # 2. CASO RELAY: Tenho de reencaminhar? (O2 ou O3)
+            else:
+                with self.lock:
+                    route_info = self.routes.get(dst)
+                
+                if route_info:
+                    next_hop = route_info["next"]
+                    
+                    # Verificar se o vizinho está conectado
+                    with self.lock:
+                        conn_info = self.sock_peers.get(next_hop)
+                        
+                    if conn_info:
+                        # 
+                        # Reencaminhar o pacote sem tocar no payload
+                        send_json(conn_info["sock"], msg)
+                        log(self.node_id, f"FORWARDED STREAM_DATA to {dst} via {next_hop}")
+                    else:
+                        log(self.node_id, f"DROP: Next hop {next_hop} for {dst} is down. Recalculando rotas...")
+                else:
+                    log(self.node_id, f"DROP: No active route to {dst}. O Dijkstra nao tem caminho.")
 
 
     ###########################################################################
@@ -679,12 +784,20 @@ if __name__ == "__main__":
 
     mode = sys.argv[1]
     node_id = sys.argv[2]
-
+    
     node = OTTNode(node_id, mode)
-
+    
     if mode == "server":
         topo_file = sys.argv[3]
+        
+        # Chamada para iniciar o stream (No O1)
+        def start_test_stream():
+            time.sleep(15)
+            node.start_streaming("O4", "3min.mp4") # Enviar para o O4 (onde está o cliente C1)
+            
+        threading.Thread(target=start_test_stream, daemon=True).start()
         node.run_server(topo_file)
-    else:
+
+    elif mode == "relay":
         server_ip = sys.argv[3]
         node.run_relay(server_ip)
