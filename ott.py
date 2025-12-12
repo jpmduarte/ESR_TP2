@@ -4,6 +4,7 @@ import threading
 import json
 from datetime import datetime
 import sys
+import os
 import time
 import heapq
 import tkinter as tk
@@ -13,10 +14,16 @@ import numpy as np
 import struct
 import random
 
+ANNOUNCE_INTERVAL = 10   # seconds (control-plane only)
 BOOTSTRAP_PORT = 5000
 BASE_TCP_PORT  = 6000
 BASE_UDP_PORT  = 8000
 PING_INTERVAL  = 2    # seconds between PINGs (faster for video)
+
+# End-to-end path test (Etapa 3 style)
+TRACE_INTERVAL = 15   # seconds between TRACE_PING batches (source only)
+TRACE_TTL      = 32   # hop limit for TRACE_PING forwarding
+MAX_TRACE_TARGETS = 5 # cap per interval to avoid flooding
 
 # Routing / LSA parameters
 LSA_INTERVAL   = 10
@@ -28,6 +35,10 @@ RTT_CHANGE_EPS = 0.005
 # RTP constants
 RTP_VERSION = 2
 RTP_PAYLOAD_TYPE = 96  # Dynamic payload type for H.264
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def log(tag, msg):
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -72,6 +83,9 @@ def close_socket(s):
     except Exception:
         pass
 
+# ---------------------------------------------------------------------------
+# RTP Packet Handler
+# ---------------------------------------------------------------------------
 
 class RTPPacket:
     """Simple RTP packet encoder/decoder for video streaming."""
@@ -117,6 +131,9 @@ class RTPPacket:
         
         return sequence, timestamp, payload
 
+# ---------------------------------------------------------------------------
+# Enhanced Client GUI
+# ---------------------------------------------------------------------------
 
 class ClientGUI:
     def __init__(self, node):
@@ -327,6 +344,9 @@ class ClientGUI:
     def run(self):
         self.root.mainloop()
 
+# ---------------------------------------------------------------------------
+# Bootstrap server
+# ---------------------------------------------------------------------------
 
 class BootstrapServer:
     def __init__(self, topo_file):
@@ -449,6 +469,10 @@ class BootstrapServer:
             log("BOOT", f"Node disconnected: {nid}")
             self.notify_neighbors_dead_node(nid)
 
+# ---------------------------------------------------------------------------
+# Multicast tree with RTP streaming
+# ---------------------------------------------------------------------------
+
 
 class MulticastTree:
     def __init__(self, node):
@@ -456,7 +480,48 @@ class MulticastTree:
         self.stream_sources = {}
         self.stream_trees = {}
         self.stream_seen = set()
+        self.sid_prefix_map = {}
         self.pending_rejoins = set()
+        self.announce_seq = {}     # sid -> last seq seen
+        self.local_seq = 0         # for sources
+
+    def reannounce_stream(self, sid):
+        """Source-only: send a newer STREAM_ANNOUNCE for an existing stream."""
+        with self.node.lock:
+            # only the source should reannounce
+            if self.stream_sources.get(sid) != self.node.node_id:
+                return
+
+            self.local_seq += 1
+            seq = self.local_seq
+            self.announce_seq[(sid, self.node.node_id)] = seq
+
+        msg = {
+            "type": "STREAM_ANNOUNCE",
+            "stream_id": sid,
+            "source": self.node.node_id,
+            "seq": seq,
+        }
+        self._flood_announce(msg, exclude=None)
+        self._log(f"Re-announced stream {sid} seq={seq}")
+
+
+    def periodic_announce_loop(self):
+        """Source-only: periodically re-flood all local streams."""
+        while self.node.running:
+            time.sleep(ANNOUNCE_INTERVAL)
+
+            # Optional: only start reannouncing after the source has started streaming
+            if not getattr(self.node, "source_stream_started", False):
+                continue
+
+            with self.node.lock:
+                # reannounce only streams for which THIS node is the source
+                local_streams = [sid for sid, src in self.stream_sources.items()
+                                if src == self.node.node_id]
+
+            for sid in local_streams:
+                self.reannounce_stream(sid)
 
     def _log(self, msg):
         log(self.node.node_id, msg)
@@ -480,6 +545,7 @@ class MulticastTree:
             return bool(tree and (tree["local_sink"] or tree["children"]))
 
     def announce_stream(self, sid):
+        # Update local tables
         with self.node.lock:
             self.stream_sources[sid] = self.node.node_id
             self.stream_seen.add(sid)
@@ -490,18 +556,33 @@ class MulticastTree:
                 "local_sink": False,
             }
 
-        msg = {"type": "STREAM_ANNOUNCE", "stream_id": sid, "source": self.node.node_id}
+            # New: monotonic seq for this source
+            self.local_seq += 1
+            seq = self.local_seq
+
+            # Record our own announce as "seen"
+            self.announce_seq[(sid, self.node.node_id)] = seq
+
+        # Keep your 4-byte prefix mapping (still recommended to make sid unique!)
+        prefix = sid[:4]
+        self.sid_prefix_map[prefix] = sid
+
+        msg = {
+            "type": "STREAM_ANNOUNCE",
+            "stream_id": sid,
+            "source": self.node.node_id,
+            "seq": seq,
+        }
         self._flood_announce(msg, exclude=None)
-        self._log(f"Announced stream {sid}")
+        self._log(f"Announced stream {sid} seq={seq}")
 
     def _flood_announce(self, msg, exclude):
-        with self.node.lock:
-            peers = list(self.node.neighbors_out.items())
-        for nid, sock in peers:
+        peers = self.node.all_peer_socks()
+        for nid, sock in peers.items():
             if nid == exclude:
                 continue
             send_json(sock, msg)
-
+            
     def on_new_peer(self, nid, sock):
         with self.node.lock:
             streams = dict(self.stream_sources)
@@ -509,49 +590,127 @@ class MulticastTree:
             send_json(sock, {"type": "STREAM_ANNOUNCE", "stream_id": sid, "source": src})
 
     def handle_stream_announce(self, msg, from_nid):
-        sid = msg["stream_id"]
-        src = msg["source"]
+        sid = msg.get("stream_id")
+        src = msg.get("source")
+        seq = int(msg.get("seq", 0))
+
+        if not sid or not src:
+            return
 
         with self.node.lock:
-            if sid in self.stream_seen:
+            last = self.announce_seq.get((sid, src), -1)
+
+            # Drop only if it's not newer than what we already saw
+            if seq <= last:
                 return
+
+            # Accept + remember newest
+            self.announce_seq[(sid, src)] = seq
             self.stream_seen.add(sid)
             self.stream_sources[sid] = src
 
-        self._log(f"Learned stream {sid} from {src} via {from_nid}")
+        prefix = sid[:4]
+        self.sid_prefix_map[prefix] = sid
+
+        self._log(f"Learned stream {sid} from {src} via {from_nid} seq={seq}")
         self._flood_announce(msg, exclude=from_nid)
 
+    # ========== FIXED JOIN LOGIC ==========
     def join_stream(self, sid):
         """Join a stream as a viewer (local sink)."""
         with self.node.lock:
             src = self.stream_sources.get(sid)
+            if not src:
+                self._log(f"JOIN: No source known for stream {sid}")
+                return
+            
+            if src == self.node.node_id:
+                self._log(f"JOIN: We are the source for {sid}, not sending JOIN")
+                tree = self._ensure_tree(sid)
+                tree["local_sink"] = True
+                return
+            
             tree = self._ensure_tree(sid)
-
-            was_sink = tree["local_sink"]
             tree["local_sink"] = True
-
-            if src and tree["parent"] is None and src != self.node.node_id:
-                nh = self.node.get_next_hop(src)
-                if nh is not None:
-                    tree["parent"] = nh
-                    self._log(f"JOIN: set parent={nh} for local stream {sid}")
-
-            self._log(
-                f"JOIN: Joining stream {sid} - was_sink={was_sink}, "
-                f"parent={tree['parent']}, children={list(tree['children'])}"
-            )
-
-        if not src:
-            self._log(f"JOIN: No source known for stream {sid}")
-            return
-
-        if src == self.node.node_id:
-            self._log(f"JOIN: We are the source for {sid}, not sending JOIN")
-            return
-
+            
+            # Get next hop toward source
+            nh = self.node.get_next_hop(src)
+            if nh is None:
+                self._log(f"JOIN: No route to source {src} for stream {sid}")
+                self.pending_rejoins.add(sid)
+                return
+            
+            # If we already have a parent, we're already in the tree
+            if tree["parent"] is not None:
+                self._log(f"JOIN: Already in tree for {sid} with parent {tree['parent']}")
+                return
+            
+            # Set parent and send JOIN to next hop (not directly to source!)
+            tree["parent"] = nh
+            self._log(f"JOIN: Setting parent={nh} for stream {sid}, sending JOIN")
+        
+        # Send JOIN to next hop toward source
         msg = {"type": "STREAM_JOIN", "stream_id": sid, "subscriber": self.node.node_id}
-        self.node.send_to_node(src, msg)
-        self._log(f"JOIN: Sent STREAM_JOIN for {sid} towards source {src}")
+        with self.node.lock:
+            sock = self.node.neighbors_out.get(nh)
+        
+        if sock:
+            send_json(sock, msg)
+            self._log(f"JOIN: Sent STREAM_JOIN for {sid} to next-hop {nh}")
+        else:
+            self._log(f"JOIN: No socket to next-hop {nh}")
+
+    def handle_stream_join(self, msg, from_nid):
+        """Handle incoming STREAM_JOIN from a downstream node."""
+        sid = msg["stream_id"]
+        
+        with self.node.lock:
+            src = self.stream_sources.get(sid)
+        
+        if not src:
+            self._log(f"STREAM_JOIN: Unknown stream {sid}")
+            return
+
+        tree = self._ensure_tree(sid)
+        
+        # Add the requesting node as our child
+        with self.node.lock:
+            if from_nid not in tree["children"]:
+                tree["children"].add(from_nid)
+                self._log(f"STREAM_JOIN sid={sid}: added child={from_nid}, total children={len(tree['children'])}")
+            else:
+                self._log(f"STREAM_JOIN sid={sid}: {from_nid} already a child")
+
+        # If we're the source, we're done
+        if self.node.node_id == src:
+            self._log(f"STREAM_JOIN: We are source for {sid}, not forwarding")
+            return
+
+        # If we already have a parent, we're already receiving the stream
+        with self.node.lock:
+            if tree["parent"] is not None:
+                self._log(f"STREAM_JOIN: Already in tree with parent={tree['parent']}, not forwarding")
+                return
+
+        # We need to join the tree ourselves
+        nh = self.node.get_next_hop(src)
+        if nh is None:
+            self._log(f"STREAM_JOIN: No route to source {src}")
+            return
+
+        with self.node.lock:
+            tree["parent"] = nh
+        
+        self._log(f"STREAM_JOIN: Set parent={nh}, forwarding JOIN to next-hop")
+        
+        # Forward the JOIN to our parent
+        with self.node.lock:
+            sock = self.node.neighbors_out.get(nh)
+        
+        if sock:
+            send_json(sock, msg)
+        else:
+            self._log(f"STREAM_JOIN: No socket to next-hop {nh}")
 
     def leave_stream(self, sid):
         """Explicitly leave a stream and notify parent."""
@@ -564,16 +723,13 @@ class MulticastTree:
                 self._log(f"LEAVE: No tree for stream {sid}")
                 return
             
-            was_sink = tree["local_sink"]
             tree["local_sink"] = False
             parent = tree["parent"]
             has_children = bool(tree["children"])
             
-            self._log(
-                f"LEAVE: Stream {sid} - was_sink={was_sink}, "
-                f"parent={parent}, children={list(tree['children'])}"
-            )
+            self._log(f"LEAVE: Stream {sid} - parent={parent}, children={len(tree['children'])}")
 
+        # Only leave if we have no children (not a forwarder)
         if not has_children and parent:
             msg = {"type": "STREAM_LEAVE", "stream_id": sid, "subscriber": self.node.node_id}
             
@@ -583,120 +739,40 @@ class MulticastTree:
             if sock:
                 send_json(sock, msg)
                 self._log(f"LEAVE: Sent STREAM_LEAVE for {sid} to parent {parent}")
-            else:
-                self._log(f"LEAVE: No socket to parent {parent}")
             
             with self.node.lock:
-                tree = self.stream_trees.get(sid)
-                if tree:
-                    tree["parent"] = None
-                    self._log(f"LEAVE: Cleared parent for stream {sid}")
-        else:
-            self._log("LEAVE: Staying in tree as forwarder "
-                      f"(has {len(self.stream_trees.get(sid, {}).get('children', []))} children)")
-
-    def handle_stream_join(self, msg, from_nid):
-        sid = msg["stream_id"]
-        
-        with self.node.lock:
-            src = self.stream_sources.get(sid)
-        if not src:
-            self._log(f"STREAM_JOIN: Unknown stream {sid}")
-            return
-
-        tree = self._ensure_tree(sid)
-        
-        with self.node.lock:
-            tree["children"].add(from_nid)
-            self._log(f"STREAM_JOIN sid={sid}: added child={from_nid}, children={tree['children']}")
-
-        if self.node.node_id == src:
-            self._log("STREAM_JOIN: We are source, not forwarding")
-            return
-
-        nh = self.node.get_next_hop(src)
-        if nh is None:
-            self._log(f"STREAM_JOIN: No route to source {src}")
-            return
-
-        should_forward = False
-        with self.node.lock:
-            if tree["parent"] is None:
-                tree["parent"] = nh
-                should_forward = True
-                self._log(f"STREAM_JOIN: Set parent={nh} for stream {sid}")
-            else:
-                self._log(f"STREAM_JOIN: Already have parent={tree['parent']}, not forwarding")
-
-        if should_forward:
-            self._log(f"STREAM_JOIN: Forwarding to source {src} via next-hop {nh}")
-            self.node.send_to_node(src, msg)
+                tree["parent"] = None
 
     def handle_stream_leave(self, msg, from_nid):
         """Handle STREAM_LEAVE from a child."""
         sid = msg["stream_id"]
         
-        parent = None
-        should_propagate = False
-        local_sink = False
-        remaining_children = 0
-        
         with self.node.lock:
             tree = self.stream_trees.get(sid)
             if not tree:
-                self._log(f"LEAVE: No tree for stream {sid}")
                 return
             
-            if from_nid in tree["children"]:
-                tree["children"].discard(from_nid)
-                self._log(f"LEAVE: Removed child {from_nid} from stream {sid}")
-            else:
-                self._log(f"LEAVE: Child {from_nid} not in children list for stream {sid}")
+            tree["children"].discard(from_nid)
+            self._log(f"LEAVE: Removed child {from_nid} from {sid}, remaining={len(tree['children'])}")
             
-            local_sink = tree["local_sink"]
-            remaining_children = len(tree["children"])
-            parent = tree["parent"]
-            
-            self._log(
-                f"LEAVE: After removing {from_nid} - local_sink={local_sink}, "
-                f"children={list(tree['children'])}, parent={parent}"
-            )
-            
-            if not local_sink and remaining_children == 0:
-                should_propagate = True
+            # If no local sink and no children, propagate leave
+            if not tree["local_sink"] and not tree["children"]:
+                parent = tree["parent"]
                 tree["parent"] = None
-                self._log(f"LEAVE: No more interest in {sid}, will propagate to parent {parent}")
-        
-        if should_propagate and parent:
-            with self.node.lock:
-                sock = self.node.neighbors_out.get(parent)
-            
-            if sock:
-                leave_msg = {"type": "STREAM_LEAVE", "stream_id": sid,
-                             "subscriber": self.node.node_id}
-                send_json(sock, leave_msg)
-                self._log(f"LEAVE: Propagated STREAM_LEAVE for {sid} to parent {parent}")
-            else:
-                self._log(f"LEAVE: No socket to parent {parent} for propagation")
-        elif not should_propagate:
-            self._log(f"LEAVE: Not propagating - local_sink={local_sink}, "
-                      f"children={remaining_children}")
-
+                
+                if parent:
+                    sock = self.node.neighbors_out.get(parent)
+                    if sock:
+                        leave_msg = {"type": "STREAM_LEAVE", "stream_id": sid,
+                                   "subscriber": self.node.node_id}
+                        send_json(sock, leave_msg)
+                        self._log(f"LEAVE: Propagated to parent {parent}")
 
     def _rejoin_stream_after_parent_loss(self, sid):
-        """
-        Called when we lost our parent for stream `sid`.
-
-        Goal:
-          - If we (or our children) still care about this stream,
-            find the new next-hop to the source using updated routes
-            and send a fresh STREAM_JOIN towards the source.
-          - If there's no route yet, mark as pending and retry when
-            the routing table changes (on_routes_changed).
-        """
+        """Rejoin stream after losing parent."""
         with self.node.lock:
-            src   = self.stream_sources.get(sid)
-            tree  = self.stream_trees.get(sid)
+            src = self.stream_sources.get(sid)
+            tree = self.stream_trees.get(sid)
             routes = dict(self.node.routes)
 
         if not tree or not src or src == self.node.node_id:
@@ -705,46 +781,37 @@ class MulticastTree:
         if not tree["local_sink"] and not tree["children"]:
             with self.node.lock:
                 self.pending_rejoins.discard(sid)
-            self._log(f"REJOIN {sid}: no local sink and no children, not rejoining")
             return
 
-        nh = None
-        if src in routes:
-            nh = routes[src][0]
-
+        nh = routes.get(src, (None,))[0] if src in routes else None
+        
         if nh is None:
             with self.node.lock:
                 self.pending_rejoins.add(sid)
-            self._log(
-                f"REJOIN {sid}: no route to source {src} yet, "
-                "will retry when routes change"
-            )
+            self._log(f"REJOIN {sid}: no route yet, will retry on route update")
             return
 
         with self.node.lock:
+            old_parent = tree["parent"]
             tree["parent"] = nh
             self.pending_rejoins.discard(sid)
 
-        join_msg = {
-            "type": "STREAM_JOIN",
-            "stream_id": sid,
-            "subscriber": self.node.node_id,
-        }
-        self.node.send_to_node(src, join_msg)
-        self._log(
-            f"REJOIN {sid}: new parent={nh}, sent STREAM_JOIN towards source {src}"
-        )
+        join_msg = {"type": "STREAM_JOIN", "stream_id": sid, "subscriber": self.node.node_id}
+        with self.node.lock:
+            sock = self.node.neighbors_out.get(nh)
+        
+        if sock:
+            send_json(sock, join_msg)
+            self._log(f"REJOIN {sid}: old_parent={old_parent}, new_parent={nh}")
+        else:
+            # No socket yet - mark as pending and retry later
+            with self.node.lock:
+                tree["parent"] = None
+                self.pending_rejoins.add(sid)
+            self._log(f"REJOIN {sid}: no socket to {nh} yet, will retry")
 
     def on_routes_changed(self):
-        """
-        Called after the overlay recomputes unicast routes.
-
-        For each stream where we still have interest (local sink or children):
-        - Ensure our multicast parent == current unicast next-hop to the source.
-        - If the parent should change, send LEAVE to the old parent and JOIN
-            towards the source via the new parent.
-        - If we lost the route entirely, fall back to _rejoin_stream_after_parent_loss.
-        """
+        """Update multicast parents when unicast routes change."""
         with self.node.lock:
             streams = list(self.stream_trees.items())
             routes = dict(self.node.routes)
@@ -765,124 +832,99 @@ class MulticastTree:
                 old_parent = tree["parent"]
 
             if new_parent is None:
-                self._log(
-                    f"ROUTES_CHANGED {sid}: lost route to src={src}, "
-                    f"old_parent={old_parent}"
-                )
                 self._rejoin_stream_after_parent_loss(sid)
                 continue
 
             if old_parent == new_parent:
                 continue
 
-            self._log(
-                f"ROUTES_CHANGED {sid}: switching parent {old_parent} → {new_parent} "
-                f"(src={src})"
-            )
+            self._log(f"ROUTES_CHANGED {sid}: {old_parent} → {new_parent}")
 
-            if old_parent is not None:
+            if old_parent:
                 with self.node.lock:
                     sock = self.node.neighbors_out.get(old_parent)
                 if sock:
-                    leave = {
-                        "type": "STREAM_LEAVE",
-                        "stream_id": sid,
-                        "subscriber": self.node.node_id,
-                    }
+                    leave = {"type": "STREAM_LEAVE", "stream_id": sid,
+                           "subscriber": self.node.node_id}
                     send_json(sock, leave)
-                    self._log(
-                        f"ROUTES_CHANGED {sid}: sent LEAVE to old parent {old_parent}"
-                    )
 
             with self.node.lock:
                 tree = self.stream_trees.get(sid)
-                if not tree:
-                    continue
-                tree["parent"] = new_parent
+                if tree:
+                    tree["parent"] = new_parent
 
-            join = {
-                "type": "STREAM_JOIN",
-                "stream_id": sid,
-                "subscriber": self.node.node_id,
-            }
-            self.node.send_to_node(src, join)
-            self._log(
-                f"ROUTES_CHANGED {sid}: sent JOIN towards src={src} via {new_parent}"
-            )
+            join = {"type": "STREAM_JOIN", "stream_id": sid, "subscriber": self.node.node_id}
+            with self.node.lock:
+                sock = self.node.neighbors_out.get(new_parent)
+            if sock:
+                send_json(sock, join)
 
         with self.node.lock:
             pending = list(self.pending_rejoins)
         for sid in pending:
             self._rejoin_stream_after_parent_loss(sid)
 
-
     def on_neighbor_gone(self, nid):
-        """
-        Called whenever an overlay neighbor disappears (TCP closed or DEAD_NODE).
-        - Prunes it from children.
-        - If it was parent: triggers rejoin.
-        - If losing this child leaves us with no sink and no children,
-          propagate STREAM_LEAVE upstream.
-        """
+        """Handle neighbor disconnection."""
         lost_parent_streams = []
         to_propagate = []
 
         with self.node.lock:
             for sid, tree in self.stream_trees.items():
-                changed_child = False
-
                 if nid in tree["children"]:
                     tree["children"].discard(nid)
-                    changed_child = True
-                    self._log(f"Neighbor gone: pruned child {nid} from stream {sid}")
+                    self._log(f"Neighbor gone: pruned {nid} from {sid}")
 
                 if tree["parent"] == nid:
                     tree["parent"] = None
                     lost_parent_streams.append(sid)
-                    self._log(f"Neighbor gone: lost parent {nid} for stream {sid}")
+                    self._log(f"Neighbor gone: lost parent {nid} for {sid}")
 
-                if changed_child and not tree["local_sink"] and not tree["children"] and tree["parent"]:
+                if not tree["local_sink"] and not tree["children"] and tree["parent"]:
                     parent = tree["parent"]
                     tree["parent"] = None
                     to_propagate.append((sid, parent))
-                    self._log(
-                        f"Neighbor gone: no more interest in {sid}, "
-                        f"will send LEAVE to parent {parent}"
-                    )
 
+        # CRITICAL: Trigger immediate route recomputation before attempting rejoin
+        # This ensures we have fresh routes that don't include the dead neighbor
+        if lost_parent_streams:
+            self._log(f"Neighbor {nid} gone: triggering route recomputation before rejoin")
+            self.node.compute_routes()
+        
         for sid in lost_parent_streams:
             self._rejoin_stream_after_parent_loss(sid)
 
         for sid, parent in to_propagate:
-            leave_msg = {"type": "STREAM_LEAVE", "stream_id": sid, "subscriber": self.node.node_id}
+            leave_msg = {"type": "STREAM_LEAVE", "stream_id": sid, 
+                        "subscriber": self.node.node_id}
             with self.node.lock:
                 sock = self.node.neighbors_out.get(parent)
             if sock:
                 send_json(sock, leave_msg)
-                self._log(f"Neighbor gone: propagated STREAM_LEAVE for {sid} to parent {parent}")
-            else:
-                self._log(f"Neighbor gone: no socket to parent {parent} to propagate LEAVE for {sid}")
 
     def handle_rtp_packet(self, data, from_addr):
         """Handle incoming RTP video packet."""
         if len(data) < 16:
             return
         
-        sid = data[:4].decode('ascii', errors='ignore').strip('\x00')
+        # 4-byte prefix from RTP header
+        sid_prefix = data[:4].decode('ascii', errors='ignore').strip('\x00')
         rtp_data = data[4:]
         
         parsed = RTPPacket.parse_packet(rtp_data)
         if not parsed:
             return
         
-        seq, timestamp, payload = parsed  
-
+        seq, timestamp, payload = parsed  # seq/timestamp unused but parsed for completeness
+        
         with self.node.lock:
+            # Map 4-char prefix back to full stream_id if possible
+            sid = self.sid_prefix_map.get(sid_prefix, sid_prefix)
             tree = self.stream_trees.get(sid) or self._ensure_tree(sid)
             local_sink = tree["local_sink"]
             children = set(tree["children"])
             neighbors_cfg = dict(self.node.neighbors_cfg)
-            
+                        
         if local_sink:
             try:
                 np_arr = np.frombuffer(payload, dtype=np.uint8)
@@ -942,23 +984,23 @@ class MulticastTree:
         
         while self.node.running:
             has_subs = self.has_subscribers(sid)
-            
+
+            # periodic debug
             if time.time() - last_subscriber_check > 5:
                 with self.node.lock:
                     tree = self.stream_trees.get(sid)
                     if tree:
                         self._log(
                             f"Stream {sid}: has_subscribers={has_subs}, "
-                            f"children={tree['children']}, local_sink={tree['local_sink']}"
+                            f"children={tree['children']}, "
+                            f"local_sink={tree['local_sink']}"
                         )
                 last_subscriber_check = time.time()
-            
-            if not has_subs:
-                time.sleep(0.5)
-                continue
-            
+
+            # Always advance the video (live semantics)
             ret, frame = cap.read()
             if not ret:
+                # loop video file
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
 
@@ -982,24 +1024,23 @@ class MulticastTree:
                 children = set(tree["children"])
                 neighbors_cfg = dict(self.node.neighbors_cfg)
 
-            if not children:
-                time.sleep(frame_interval)
-                frame_count += 1
-                continue
-
             sent_count = 0
-            for child in children:
-                info = neighbors_cfg.get(child)
-                if not info:
-                    continue
-                try:
-                    self.node.udp_sock.sendto(full_packet, (info["ip"], info["udp_port"]))
-                    sent_count += 1
-                except Exception as e:
-                    self._log(f"RTP send error to {child}: {e}")
+            if has_subs and children:
+                for child in children:
+                    info = neighbors_cfg.get(child)
+                    if not info:
+                        continue
+                    try:
+                        self.node.udp_sock.sendto(full_packet, (info["ip"], info["udp_port"]))
+                        sent_count += 1
+                    except Exception as e:
+                        self._log(f"RTP send error to {child}: {e}")
 
             if frame_count % 30 == 0:
-                self._log(f"Sent frame {frame_count} to {sent_count} children: {children}")
+                self._log(
+                    f"Sent frame {frame_count} to {sent_count} children: {children} "
+                    f"(has_subs={has_subs})"
+                )
 
             frame_count += 1
             time.sleep(frame_interval)
@@ -1007,18 +1048,21 @@ class MulticastTree:
         cap.release()
         self._log(f"Video stream loop ended for {sid}")
 
+# ---------------------------------------------------------------------------
+# Overlay node
+# ---------------------------------------------------------------------------
 
 class OverlayNode:
     def __init__(self, node_id, tcp_port, udp_port, bootstrap_ip,
-                 is_source=False, client_stream_id=None, video_path=None):
+                 is_source=False, client_stream_id=None, video_path=None,stream_id=None):
         self.node_id = node_id
         self.tcp_port = tcp_port
         self.udp_port = udp_port
         self.bootstrap_ip = bootstrap_ip
         self.is_source = is_source
+        self.stream_id = stream_id
         self.client_stream_id = client_stream_id
         self.video_path = video_path
-
         self.neighbors_cfg = {}
         self.neighbors_out = {}
         self.neighbors_in = {}
@@ -1041,6 +1085,7 @@ class OverlayNode:
         self.mtree = MulticastTree(self)
 
         self.source_stream_started = False
+        self.trace_seq = 0
         self.client_joined = False
 
         self.last_frame = None
@@ -1050,6 +1095,13 @@ class OverlayNode:
         self.frames_received = 0
         self.frame_times = []
         self.current_fps = 0.0
+
+    def all_peer_socks(self):
+        with self.lock:
+            peers = dict(self.neighbors_out)
+            for nid, s in self.neighbors_in.items():
+                peers.setdefault(nid, s)
+        return peers
 
     def register_to_bootstrap(self):
         s = socket.socket()
@@ -1225,6 +1277,52 @@ class OverlayNode:
         else:
             log(self.node_id, f"No route/socket to {dst} via {nh}")
 
+
+
+    def send_trace_ping(self, dst):
+        """Send an end-to-end TRACE_PING towards dst following current routes."""
+        if dst == self.node_id:
+            return
+        now = time.time()
+        with self.lock:
+            self.trace_seq += 1
+            seq = self.trace_seq
+        msg = {
+            "type": "TRACE_PING",
+            "src": self.node_id,
+            "dst": dst,
+            "ts": now,
+            "seq": seq,
+            "ttl": TRACE_TTL,
+            "path": [],
+        }
+        self.send_to_node(dst, msg)
+
+    def trace_ping_loop(self):
+        """Periodically test best paths (source only) by tracing to a few destinations."""
+        if not self.is_source:
+            return
+
+        while self.running:
+            time.sleep(TRACE_INTERVAL)
+
+            # Wait until the stream is actually active (matches Etapa 3 intent: generated by the server)
+            if not self.source_stream_started:
+                continue
+
+            with self.lock:
+                targets = list(self.routes.keys())
+
+            if not targets:
+                continue
+
+            # sample a few targets to avoid flooding on larger topologies
+            if len(targets) > MAX_TRACE_TARGETS:
+                targets = random.sample(targets, MAX_TRACE_TARGETS)
+
+            for dst in targets:
+                self.send_trace_ping(dst)
+
     def peer_recv_loop(self, nid, sock):
         buf = ""
         while self.running:
@@ -1245,6 +1343,58 @@ class OverlayNode:
                     elif t == "PONG":
                         rtt_raw = time.time() - msg["ts"]
                         self.update_rtt(nid, rtt_raw)
+                    elif t == "TRACE_PING":
+                        src = msg.get("src")
+                        dst = msg.get("dst")
+                        ttl = int(msg.get("ttl", TRACE_TTL))
+                        path = msg.get("path") or []
+
+                        # loop / TTL safety
+                        if self.node_id in path:
+                            log(self.node_id, f"TRACE_PING loop detected src={src} dst={dst} path={path}")
+                            continue
+                        if ttl <= 0:
+                            log(self.node_id, f"TRACE_PING ttl expired src={src} dst={dst} path={path}")
+                            continue
+
+                        path = list(path) + [self.node_id]
+                        msg["path"] = path
+                        msg["ttl"] = ttl - 1
+
+                        log(self.node_id, f"TRACE_PING hop src={src} dst={dst} path={path}")
+
+                        if dst == self.node_id:
+                            # reached target: reply back to src using routing table
+                            reply = {
+                                "type": "TRACE_PONG",
+                                "src": src,
+                                "dst": dst,
+                                "ts": msg.get("ts"),
+                                "seq": msg.get("seq"),
+                                "path": path,
+                            }
+                            if src:
+                                self.send_to_node(src, reply)
+                        else:
+                            if dst:
+                                self.send_to_node(dst, msg)
+
+                    elif t == "TRACE_PONG":
+                        src = msg.get("src")
+                        dst = msg.get("dst")
+                        path = msg.get("path") or []
+                        ts = msg.get("ts")
+
+                        if src == self.node_id:
+                            rtt = (time.time() - ts) if ts else None
+                            if rtt is not None:
+                                log(self.node_id, f"TRACE_PONG from {dst} seq={msg.get('seq')} rtt={rtt:.3f}s path={path}")
+                            else:
+                                log(self.node_id, f"TRACE_PONG from {dst} seq={msg.get('seq')} path={path}")
+                        else:
+                            # forward back to origin
+                            if src:
+                                self.send_to_node(src, msg)
                     elif t == "LSA":
                         self.handle_lsa(msg, from_nid=nid)
                     elif t == "STREAM_ANNOUNCE":
@@ -1256,6 +1406,7 @@ class OverlayNode:
                 except Exception as e:
                     log(self.node_id, f"Error handling {t} from {nid}: {e}")
 
+        # Connection lost - cleanup
         with self.lock:
             if self.neighbors_out.get(nid) is sock:
                 self.neighbors_out.pop(nid, None)
@@ -1265,7 +1416,12 @@ class OverlayNode:
         
         close_socket(sock)
         
-        self.generate_lsa(force=True)
+        log(self.node_id, f"Neighbor {nid} disconnected - updating routing")
+        self.generate_lsa(force=True)  # Floods LSA and calls compute_routes()
+        
+        # Small delay to allow LSA propagation to other nodes
+        time.sleep(0.1)
+        
         self.mtree.on_neighbor_gone(nid)
 
     def update_rtt(self, nid, rtt_raw):
@@ -1288,9 +1444,8 @@ class OverlayNode:
         while self.running:
             time.sleep(PING_INTERVAL)
             now = time.time()
-            with self.lock:
-                peers = list(self.neighbors_out.items())
-            for nid, s in peers:
+            peers = self.all_peer_socks()
+            for nid, s in peers.items():
                 send_json(s, {"type": "PING", "ts": now})
 
     def generate_lsa(self, force=False):
@@ -1345,10 +1500,8 @@ class OverlayNode:
             self.compute_routes()
 
     def flood_lsa(self, lsa, exclude=None):
-        with self.lock:
-            peers = list(self.neighbors_out.items())
-
-        for nid, sock in peers:
+        peers = self.all_peer_socks()
+        for nid, sock in peers.items():
             if nid == exclude:
                 continue
             send_json(sock, lsa)
@@ -1413,17 +1566,28 @@ class OverlayNode:
                 continue
 
     def source_stream_controller_loop(self):
-        sid = "S1"
+        # No video path → nothing to stream
+        if not self.video_path:
+            log(self.node_id, "Source mode enabled but no video_path; not starting stream")
+            return
+
+        # Derive stream_id from video filename (no extension)
+        if not self.stream_id:
+            base = os.path.basename(self.video_path)
+            self.stream_id = os.path.splitext(base)[0] or "S1"
+
+        sid = self.stream_id
+
         while self.running and not self.source_stream_started:
             with self.lock:
                 has_neighbors = len(self.neighbors_out) > 0
             
             if has_neighbors:
-                if self.video_path:
-                    log(self.node_id, f"Source: starting stream {sid}")
-                    self.mtree.start_video_stream(sid, self.video_path)
+                log(self.node_id, f"Source: starting stream {sid}")
+                self.mtree.start_video_stream(sid, self.video_path)
                 self.source_stream_started = True
                 break
+
             time.sleep(1.0)
 
     def run(self):
@@ -1437,6 +1601,9 @@ class OverlayNode:
 
         if self.is_source:
             threading.Thread(target=self.source_stream_controller_loop, daemon=True).start()
+            threading.Thread(target=self.trace_ping_loop, daemon=True).start()
+            threading.Thread(target=self.mtree.periodic_announce_loop, daemon=True).start()
+
 
         log(self.node_id, "Overlay node running.")
         
@@ -1462,42 +1629,81 @@ class OverlayNode:
             time.sleep(LSA_INTERVAL)
             self.generate_lsa()
 
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
 
 def node_num_from_id(nid: str) -> int:
     if len(nid) > 1 and nid[0].isalpha():
         return int(nid[1:])
     return int(nid)
 
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage:")
-        print(f"  {sys.argv[0]} server <node_id> <topology.json> [video_path]")
-        print(f"  {sys.argv[0]} node   <node_id> <bootstrap_ip>")
-        print(f"  {sys.argv[0]} client <node_id> <bootstrap_ip>")
+        print(f"  {sys.argv[0]} bootstrap <node_id> <topology.json> [video_path]")
+        print(f"  {sys.argv[0]} server    <node_id> <bootstrap_ip> <video_path>")
+        print(f"  {sys.argv[0]} node      <node_id> <bootstrap_ip>")
+        print(f"  {sys.argv[0]} client    <node_id> <bootstrap_ip>")
         sys.exit(1)
 
     mode = sys.argv[1]
 
-    if mode == "server":
-        if len(sys.argv) not in (4, 5):
-            print(f"Usage: {sys.argv[0]} server <node_id> <topology.json> [video_path]")
+    if mode == "bootstrap":
+        # sys.argv = [prog, "bootstrap", node_id, topology.json, video_path, bootstrapper_ip]
+        if len(sys.argv) != 6:
+            print(f"Usage: {sys.argv[0]} bootstrap <node_id> <topology.json> <video_path> <bootstrapper_ip>")
             sys.exit(1)
 
-        node_id = sys.argv[2]
-        topo_file = sys.argv[3]
-        video_path = sys.argv[4] if len(sys.argv) == 5 else None
+        node_id       = sys.argv[2]
+        topo_file     = sys.argv[3]
+        video_path    = sys.argv[4]
+        bootstrap_ip  = sys.argv[5]
 
+        # Start bootstrap server (control plane)
         server = BootstrapServer(topo_file)
         threading.Thread(target=server.run, daemon=True).start()
 
-        n = node_num_from_id(node_id)
+        # Bootstrap can also be an overlay node (a video source in this mode)
+        n        = node_num_from_id(node_id)
         tcp_port = BASE_TCP_PORT + n
         udp_port = BASE_UDP_PORT + n
-        bootstrap_ip = "10.0.0.10"
 
-        node = OverlayNode(node_id, tcp_port, udp_port, bootstrap_ip,
-                           is_source=True, client_stream_id=None,
-                           video_path=video_path)
+        stream_id = os.path.splitext(os.path.basename(video_path))[0]
+
+        node = OverlayNode(
+            node_id, tcp_port, udp_port, bootstrap_ip,
+            is_source=True,
+            client_stream_id=None,
+            video_path=video_path,
+            stream_id=stream_id,
+        )
+        node.run()
+
+    elif mode == "server":
+        if len(sys.argv) != 5:
+            print(f"Usage: {sys.argv[0]} server <node_id> <bootstrap_ip> <video_path>")
+            sys.exit(1)
+
+        node_id      = sys.argv[2]
+        bootstrap_ip = sys.argv[3]
+        video_path   = sys.argv[4]
+
+        n        = node_num_from_id(node_id)
+        tcp_port = BASE_TCP_PORT + n
+        udp_port = BASE_UDP_PORT + n
+
+        # One stream per server: name = filename without extension
+        stream_id = os.path.splitext(os.path.basename(video_path))[0]
+
+        node = OverlayNode(
+            node_id, tcp_port, udp_port, bootstrap_ip,
+            is_source=True,
+            client_stream_id=None,
+            video_path=video_path,
+            stream_id=stream_id,
+        )
         node.run()
 
     elif mode == "node":
@@ -1505,16 +1711,20 @@ if __name__ == "__main__":
             print(f"Usage: {sys.argv[0]} node <node_id> <bootstrap_ip>")
             sys.exit(1)
 
-        node_id = sys.argv[2]
+        node_id      = sys.argv[2]
         bootstrap_ip = sys.argv[3]
 
-        n = node_num_from_id(node_id)
+        n        = node_num_from_id(node_id)
         tcp_port = BASE_TCP_PORT + n
         udp_port = BASE_UDP_PORT + n
 
-        node = OverlayNode(node_id, tcp_port, udp_port, bootstrap_ip,
-                           is_source=False, client_stream_id=None,
-                           video_path=None)
+        node = OverlayNode(
+            node_id, tcp_port, udp_port, bootstrap_ip,
+            is_source=False,
+            client_stream_id=None,
+            video_path=None,
+            stream_id=None,
+        )
         node.run()
 
     elif mode == "client":
@@ -1522,16 +1732,20 @@ if __name__ == "__main__":
             print(f"Usage: {sys.argv[0]} client <node_id> <bootstrap_ip>")
             sys.exit(1)
 
-        node_id = sys.argv[2]
+        node_id      = sys.argv[2]
         bootstrap_ip = sys.argv[3]
 
-        n = node_num_from_id(node_id)
+        n        = node_num_from_id(node_id)
         tcp_port = BASE_TCP_PORT + n
         udp_port = BASE_UDP_PORT + n
 
-        node = OverlayNode(node_id, tcp_port, udp_port, bootstrap_ip,
-                           is_source=False, client_stream_id="S1",
-                           video_path=None)
+        node = OverlayNode(
+            node_id, tcp_port, udp_port, bootstrap_ip,
+            is_source=False,
+            client_stream_id="GUI",
+            video_path=None,
+            stream_id=None,
+        )
         node.run()
 
     else:
