@@ -1,0 +1,13 @@
+{
+  "nodes": {
+    "O1": { "neighbors": ["O2", "O7"] },
+    "O2": { "neighbors": ["O1", "O3", "O4", "O8"] },
+    "O3": { "neighbors": ["O2", "O5"] },
+    "O4": { "neighbors": ["O2", "O6"] },
+    "O5": { "neighbors": ["O6", "O3","O9"] },
+    "O6": { "neighbors": ["O5", "O7", "O8", "O4"] },
+    "O7": { "neighbors": ["O1", "O6"] },
+    "O8": { "neighbors": ["O2", "O6"] },
+    "O9" : { "neighbors": ["O5"]}
+  }
+}
