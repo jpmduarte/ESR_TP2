@@ -1,0 +1,298 @@
+# Overlay Network Video Streaming System
+
+## Overview
+
+This is a peer-to-peer overlay network system for distributed video streaming. It combines **link-state routing**, **multicast tree construction**, and **RTP-based video distribution** to enable efficient video delivery across a dynamic network topology.
+
+## System Architecture
+
+### Core Components
+
+1. **Bootstrap Server**: Central coordinator for node discovery and topology management
+2. **Overlay Nodes**: Peer nodes that participate in routing and video distribution
+3. **Multicast Trees**: Per-stream distribution trees for efficient video forwarding
+4. **Link-State Routing**: Dijkstra-based shortest path routing with RTT metrics
+5. **RTP Streaming**: Real-time transport protocol for video packet delivery
+
+### Network Layers
+
+```
+Application Layer:  Video Streaming (RTP packets over UDP)
+Overlay Layer:      Multicast trees, routing tables
+Control Layer:      LSA flooding, neighbor discovery, ping/pong
+Bootstrap Layer:    Topology management, node registration
+```
+
+## Key Protocols
+
+### 1. Node Discovery & Neighbor Management
+
+**Bootstrap Registration:**
+- Nodes connect to bootstrap server on port 5000
+- Register with node ID, IP, TCP port, UDP port
+- Receive initial neighbor list from topology file
+- Get notified of new/dead neighbors dynamically
+
+**Neighbor Connections:**
+- TCP connections for control messages (ports 6000+)
+- UDP socket for video data (ports 8000+)
+- Bidirectional handshake with HELLO messages
+- Automatic reconnection with exponential backoff
+
+### 2. Link-State Routing Protocol
+
+**RTT Measurement:**
+- Periodic PING/PONG messages every 2 seconds
+- Exponential weighted moving average (α=0.3)
+- RTT used as link cost metric
+
+**LSA (Link State Advertisement):**
+- Generated when RTT changes significantly (>0.005s delta)
+- Contains: origin node, sequence number, neighbor costs
+- Flooded to all neighbors
+- 60-second aging mechanism
+
+**Route Computation:**
+- Dijkstra's algorithm on collected LSA database
+- Computes next-hop for all reachable destinations
+- Triggered on LSA updates or topology changes
+- Routes stored as: {destination: (next_hop, total_cost)}
+
+### 3. Multicast Tree Construction
+
+**Tree Per Stream:**
+- Each video stream has independent distribution tree
+- Source-rooted spanning tree following unicast routes
+- Dynamic parent selection based on routing table
+- Explicit JOIN/LEAVE signaling
+
+**JOIN Protocol:**
+```
+1. Client discovers stream via STREAM_ANNOUNCE
+2. Determines source node and next-hop via routing table
+3. Sends STREAM_JOIN to next-hop parent
+4. Intermediate nodes forward JOIN toward source
+5. Each node adds requester as child
+6. Nodes join tree if they have downstream children
+```
+
+**LEAVE Protocol:**
+```
+1. Client sends STREAM_LEAVE to parent
+2. Node removes child from tree
+3. If no local interest and no children remain:
+   - Send LEAVE to own parent
+   - Prune self from tree
+```
+
+**Parent Failure Recovery:**
+- Detect neighbor disconnection
+- Trigger routing table recomputation
+- Automatically rejoin stream with new parent
+- Maintains continuous video delivery
+
+### 4. Video Streaming (RTP)
+
+**Packet Format:**
+```
+[4-byte Stream ID Prefix][12-byte RTP Header][JPEG Payload]
+
+RTP Header (12 bytes):
+- Version: 2 bits
+- Padding, Extension, CSRC count: 6 bits
+- Marker, Payload type: 8 bits
+- Sequence number: 16 bits
+- Timestamp: 32 bits (90kHz clock)
+- SSRC: 32 bits
+```
+
+**Streaming Process:**
+1. Source reads video file with OpenCV
+2. Resize frames to 640x480
+3. JPEG encode at 75% quality
+4. Wrap in RTP packet
+5. Prefix with 4-byte stream ID
+6. Send via UDP to all children in multicast tree
+
+**Frame Rate Control:**
+- Extract FPS from video file (default 25)
+- Sleep between frames: 1/fps seconds
+- Timestamp increments: (frame_count * 90000/fps)
+
+**Video Reception:**
+1. Receive RTP packet on UDP socket
+2. Extract stream ID prefix
+3. Parse RTP header, decode JPEG payload
+4. Display in GUI for local sinks
+5. Forward to children in multicast tree
+
+## Implementation Details
+
+### Thread Architecture
+
+Each node runs multiple concurrent threads:
+
+| Thread | Purpose | Frequency |
+|--------|---------|-----------|
+| `listen_overlay` | Accept TCP connections | Blocking accept() |
+| `connect_neighbors_loop` | Establish outbound connections | Every 1s |
+| `ping_loop` | Measure RTT to neighbors | Every 2s |
+| `lsa_loop` | Periodic LSA generation | Every 10s |
+| `cleanup_lsdb_loop` | Remove stale LSAs | Every 5s |
+| `udp_recv_loop` | Receive video packets | Blocking recvfrom() |
+| `peer_recv_loop` | Handle control messages | Per neighbor |
+| `video_stream_loop` | Send video frames | Per source stream |
+| `video_display_loop` | GUI rendering | ~30 FPS (client) |
+| `periodic_announce_loop` | Re-flood announcements | Every 10s (source) |
+
+### Message Types
+
+**Control Messages (TCP/JSON):**
+- `REGISTER`: Node → Bootstrap registration
+- `NEIGHBORS`: Bootstrap → Node initial neighbor list
+- `NEW_NODE`/`DEAD_NODE`: Bootstrap → Node topology updates
+- `HELLO`: Node → Node connection establishment
+- `PING`/`PONG`: RTT measurement
+- `LSA`: Link state advertisement flooding
+- `STREAM_ANNOUNCE`: New stream availability
+- `STREAM_JOIN`/`STREAM_LEAVE`: Multicast tree management
+- `TRACE_PING`/`TRACE_PONG`: End-to-end path tracing
+
+**Data Messages (UDP/Binary):**
+- RTP video packets with stream ID prefix
+
+### Synchronization
+
+- **Main Lock** (`self.lock`): Protects all shared state (neighbors, routes, trees)
+- **Frame Lock** (`last_frame_lock`): Protects video frame buffer for GUI
+- Thread-safe message queuing via socket buffers
+- Atomic operations for RTT updates and sequence numbers
+
+## Usage Modes
+
+### 1. Bootstrap Mode
+```bash
+python3 script.py bootstrap <node_id> topology.json <bootstrap_ip>
+```
+- Runs bootstrap server on port 5000
+- Also acts as a regular overlay node
+- Manages topology from JSON file
+
+### 2. Server Mode (Video Source)
+```bash
+python3 script.py server <node_id> <bootstrap_ip> <video_path>
+```
+- Streams video file to network
+- Announces stream to all nodes
+- Stream ID derived from filename
+
+### 3. Node Mode (Relay)
+```bash
+python3 script.py node <node_id> <bootstrap_ip>
+```
+- Participates in routing and forwarding
+- No video source or client GUI
+- Pure relay functionality
+
+### 4. Client Mode (Viewer)
+```bash
+python3 script.py client <node_id> <bootstrap_ip>
+```
+- Opens GUI to browse and view streams
+- Can join/leave streams dynamically
+- Displays FPS and network stats
+
+## Configuration Parameters
+
+```python
+ANNOUNCE_INTERVAL = 10   # Stream re-announcement period
+BOOTSTRAP_PORT = 5000    # Bootstrap server port
+BASE_TCP_PORT = 6000     # TCP port = 6000 + node_number
+BASE_UDP_PORT = 8000     # UDP port = 8000 + node_number
+PING_INTERVAL = 2        # RTT measurement frequency
+LSA_INTERVAL = 10        # Periodic LSA generation
+MIN_LSA_GAP = 3          # Minimum time between LSAs
+MAX_LSA_AGE = 60         # LSA expiration time
+RTT_ALPHA = 0.3          # EWMA smoothing factor
+RTT_CHANGE_EPS = 0.005   # RTT change threshold for LSA
+TRACE_INTERVAL = 15      # End-to-end path tracing period
+TRACE_TTL = 32           # Max hops for trace packets
+```
+
+## Topology File Format
+
+```json
+{
+  "nodes": {
+    "N1": {
+      "neighbors": ["N2", "N3"]
+    },
+    "N2": {
+      "neighbors": ["N1", "N4"]
+    },
+    "N3": {
+      "neighbors": ["N1", "N4"]
+    },
+    "N4": {
+      "neighbors": ["N2", "N3"]
+    }
+  }
+}
+```
+
+## Features
+
+### Adaptive Routing
+- Routes adapt to RTT changes automatically
+- Link failures detected via TCP disconnection
+- Alternative paths computed via Dijkstra
+
+### Scalable Multicast
+- Bandwidth-efficient: one copy per link
+- No source-specific state at non-participants
+- Graceful handling of subscriber churn
+
+### Path Quality Monitoring
+- TRACE_PING for end-to-end path validation
+- Records full path from source to destination
+- Measures round-trip time for quality assessment
+
+### Robust Stream Discovery
+- Periodic stream re-announcements (every 10s)
+- Sequence numbers prevent stale information
+- New nodes learn existing streams on join
+
+## GUI Features (Client Mode)
+
+- **Stream List**: Browse available video streams
+- **Video Display**: Real-time playback in Tkinter canvas
+- **Network Stats**: Neighbors, routes, FPS, frame count
+- **Tree Visualization**: Parent and child count for active stream
+- **Interactive Controls**: Start/stop viewing streams
+
+## Performance Characteristics
+
+**Latency Sources:**
+1. Video encoding: ~5-10ms per frame
+2. Network propagation: varies by RTT
+3. Tree depth: additional hop delays
+4. Buffering: minimal (no jitter buffer)
+
+**Throughput:**
+- 640x480 JPEG @ 75% quality ≈ 20-40 KB/frame
+- 25 FPS ≈ 500 KB/s - 1 MB/s per stream
+- UDP, no congestion control
+
+**Scalability:**
+- O(N²) control overhead (full LSA flooding)
+- O(subscribers) data bandwidth per link
+- Tree construction: O(log N) average depth
+
+## Limitations & Future Work
+
+**Current Limitations:**
+1. No congestion control or rate adaptation
+2. No forward error correction
+3. Single-source per stream (no mesh)
+4. Full LSA flooding (doesn't scale to 1000+ nodes)
+5. No authentication or encryption
